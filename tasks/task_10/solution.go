@@ -1,9 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -35,44 +39,232 @@ type inMemoryTaskRepo struct {
 }
 
 func NewInMemoryTaskRepo(clock Clock) TaskRepo {
-	panic("TODO: implement")
+	return &inMemoryTaskRepo{
+		clock: clock,
+		tasks: make(map[string]Task),
+	}
 }
 func (r *inMemoryTaskRepo) Create(title string) (Task, error) {
-	panic("TODO: implement")
+	trimTitle := strings.TrimSpace(title)
+	if trimTitle == "" {
+		return Task{}, ErrInvalidTitle
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.seq++
+	id := strconv.FormatUint(r.seq, 10)
+	task := Task{
+		ID:        id,
+		Title:     trimTitle,
+		Done:      false,
+		UpdatedAt: r.clock.Now(),
+	}
+
+	r.tasks[id] = task
+	return task, nil
 }
 func (r *inMemoryTaskRepo) Get(id string) (Task, bool) {
-	panic("TODO: implement")
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	task, ok := r.tasks[id]
+	if !ok {
+		return Task{}, false
+	}
+	return task, true
 }
 func (r *inMemoryTaskRepo) List(done bool) []Task {
-	panic("TODO: implement")
+	r.mu.RLock()
+
+	result := make([]Task, 0, len(r.tasks))
+	for _, task := range r.tasks {
+		if task.Done == done {
+			result = append(result, task)
+		}
+	}
+
+	r.mu.RUnlock()
+
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].UpdatedAt.Equal(result[j].UpdatedAt) {
+			return result[i].ID < result[j].ID
+		}
+		return result[i].UpdatedAt.After(result[j].UpdatedAt)
+	})
+	return result
 }
 func (r *inMemoryTaskRepo) SetDone(id string, done bool) (Task, error) {
-	panic("TODO: implement")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	task, ok := r.tasks[id]
+	if !ok {
+		return Task{}, ErrNotFound
+	}
+
+	if task.Done == done {
+		return task, nil
+	}
+
+	task.Done = done
+	task.UpdatedAt = r.clock.Now()
+	r.tasks[id] = task
+
+	return task, nil
 }
 
 type httpHandler struct{ repo TaskRepo }
 
 func NewHTTPHandler(repo TaskRepo) http.Handler {
-	panic("TODO: implement")
+	return &httpHandler{repo: repo}
 }
 func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	panic("TODO: implement")
+	if r.URL.Path == "/tasks" {
+		switch r.Method {
+		case http.MethodGet:
+			h.handleList(w, r)
+		case http.MethodPost:
+			h.handleCreate(w, r)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	if strings.HasPrefix(r.URL.Path, "/tasks/") {
+		id := strings.TrimPrefix(r.URL.Path, "/tasks/")
+
+		if id == "" || strings.Contains(id, "/") {
+			http.NotFound(w, r)
+			return
+		}
+
+		switch r.Method {
+		case http.MethodGet:
+			h.handleGet(w, r, id)
+		case http.MethodPatch:
+			h.handlePatch(w, r, id)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	http.NotFound(w, r)
 }
 func (h *httpHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
-	panic("TODO: implement")
+	var request struct {
+		Title *string `json:"title"`
+	}
+
+	if err := decodeStrictJSON(r.Body, &request); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if request.Title == nil {
+		http.Error(w, "title is required", http.StatusBadRequest)
+		return
+	}
+
+	task, err := h.repo.Create(*request.Title)
+	if err != nil {
+		if errors.Is(err, ErrInvalidTitle) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, task)
 }
 func (h *httpHandler) handleGet(w http.ResponseWriter, r *http.Request, id string) {
-	panic("TODO: implement")
+	task, ok := h.repo.Get(id)
+	if !ok {
+		http.Error(w, "не найдено", http.StatusNotFound)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, task)
+
 }
+
 func (h *httpHandler) handleList(w http.ResponseWriter, r *http.Request) {
-	panic("TODO: implement")
+	done := false
+	values, ok := r.URL.Query()["done"]
+	if ok {
+		if len(values) != 1 {
+			http.Error(w, "лишние значения", http.StatusBadRequest)
+			return
+		}
+
+		switch values[0] {
+		case "true":
+			done = true
+		case "false":
+			done = false
+		default:
+			http.Error(w, "невалидный done", http.StatusBadRequest)
+			return
+		}
+	}
+
+	tasks := h.repo.List(done)
+	if tasks == nil {
+		tasks = []Task{}
+	}
+	writeJSON(w, http.StatusOK, tasks)
 }
 func (h *httpHandler) handlePatch(w http.ResponseWriter, r *http.Request, id string) {
-	panic("TODO: implement")
+	var request struct {
+		Done *bool `json:"done"`
+	}
+
+	if err := decodeStrictJSON(r.Body, &request); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if request.Done == nil {
+		http.Error(w, "done is required", http.StatusBadRequest)
+		return
+	}
+
+	task, err := h.repo.SetDone(id, *request.Done)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, task)
 }
 func decodeStrictJSON(r io.Reader, v any) error {
-	panic("TODO: implement")
+	dec := json.NewDecoder(r)
+	dec.DisallowUnknownFields() // ошибка при неизвестных полях
+
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("request body must contain only one JSON object")
+		}
+		return err
+	}
+
+	return nil
 }
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	panic("TODO: implement")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
 }
